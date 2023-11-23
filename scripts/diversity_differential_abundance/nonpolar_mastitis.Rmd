@@ -1,0 +1,1692 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+library(microbial)
+library(microbiome)
+library(ggpubr)
+```
+
+#Installing library to eliminate contaminants
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("decontam")
+```
+
+#Phyloseq object
+```{r}
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis/tables/nonpolar/feature_tables")
+
+library(readxl)
+#read in otu table (smartchip normalized abundance)
+otu_table <- read_excel("nonpolar_tables_mastitis_up.xlsx", sheet = "features")
+
+library(dplyr)
+library(tibble)
+#converting the abundance table to matrix (required to merge with taxonomy table)
+otu_table <- otu_table %>% remove_rownames %>% column_to_rownames(var="Cluster_ID") 
+otu_table=as.matrix(otu_table,rownames=TRUE) 
+
+#converting empty values to 0 (in case they exist)
+otu_table[is.na(otu_table)] <- 0
+otu_table <- otu_table*10^10
+
+#read in taxonomy (gene ID for smartchip)
+taxonomy_df <- read_excel("nonpolar_tables_mastitis_up.xlsx", sheet = "taxonomy")
+
+#setting taxonomy row_names for GENE_ID (that will enable merging with the abundance table)
+taxonomy <- taxonomy_df %>% dplyr::select(1:4) %>% remove_rownames %>% column_to_rownames(var="Cluster_ID")
+taxonomy=as.matrix(taxonomy)
+
+#read in metadata
+metadata <- read_excel("nonpolar_tables_mastitis_up.xlsx", sheet = "metadata")
+
+#setting metadata row_names for sample ID (that will enable merging with the other tables)
+metadata <- metadata %>% remove_rownames %>% column_to_rownames(var="filename")
+
+library(forcats)
+#Changing the levels of source and group to make them better organized in the plots
+metadata <- metadata %>% mutate(Treatment = fct_relevel(Treatment,"Control","Antibiotic"),
+                                Time_tx = fct_relevel(Time_tx,"Day -1","Week 1","Week 9"),
+                                Group_Sampling = fct_relevel(Group_Sampling, "Control Day -1", "Antibiotic Day -1", "Control Week 1", "Antibiotic Week 1","Control Week 9", "Antibiotic Week 9"))
+
+library("phyloseq")
+
+#import all tables as phyloseq objects
+OTU = otu_table(otu_table,taxa_are_rows=TRUE)
+TAX = tax_table(taxonomy)
+META = sample_data(metadata)
+
+#Making phyloseq object
+physeq=phyloseq(OTU,TAX,META)
+```
+
+#Inspect Library Sizes
+```{r}
+library(decontam)
+
+df <- as.data.frame(sample_data(physeq)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(physeq)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=SampleType)) + geom_point()
+```
+#Identify Contaminants - Frequency
+```{r}
+contamdf.freq <- isContaminant(physeq, conc="quant_extracted")
+table(contamdf.freq$contaminant)
+```
+#Identify Contaminants - Prevalence
+```{r}
+contamdf.prev <- isContaminant(physeq, neg="neg_control",threshold=.1)
+table(contamdf.prev$contaminant)
+```
+```{r}
+# Make phyloseq object of presence-absence in negative controls and true samples
+physeq.pa <- transform_sample_counts(physeq, function(abund) 1*(abund>0))
+physeq.pa.neg <- prune_samples(sample_data(physeq.pa)$neg_control == "TRUE", physeq.pa)
+physeq.pa.pos <- prune_samples(sample_data(physeq.pa)$neg_control == "FALSE", physeq.pa)
+# Make data.frame of prevalence in positive and negative samples
+df.pa <- data.frame(pa.pos=taxa_sums(physeq.pa.pos), pa.neg=taxa_sums(physeq.pa.neg),
+                      contaminant=contamdf.prev$contaminant)
+ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant,alpha=.3)) + geom_point() +
+  xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)")
+```
+#Identify Contaminants - Combined
+```{r}
+contamdf.comb <- isContaminant(physeq, neg="neg_control",conc="quant_extracted",method="combined",threshold=.1)
+table(contamdf.comb$contaminant)
+```
+
+#Remove clusters that were classified as contaminants
+```{r}
+ps.noncontam <- prune_taxa(!contamdf.comb$contaminant, physeq)
+ps.noncontam
+```
+
+#Remove control samples and normalize table
+```{r}
+`%notin%` <- Negate(`%in%`)
+
+physeq_nocontrols <- subset_samples(ps.noncontam, SampleType%notin%c("BLANK","POOL"))
+physeq_nocontrols_relab <- microbial::normalize(physeq_nocontrols, method = "relative")
+```
+#Exporting physeq as dataframe
+```{r}
+setwd("/Users/karlavasco/Documents")
+libraryID = tax_glom(physeq_nocontrols_relab, "LibraryID")
+
+physeq_df <- psmelt(libraryID) 
+write.csv(physeq_df,file = "nonpolar_physeq_relab.csv")
+```
+
+```{r}
+physeq <- physeq_nocontrols_relab
+physeq_Component = tax_glom(physeq_nocontrols_relab, "Component")
+```
+
+###Random forest 
+CLUSTERS
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq))
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq)$Time_tx)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.clusters <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.clusters)
+```
+
+```{r fig.height=4}
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.clusters)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_clusters <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_clusters$predictors <- factor(imp.sort_clusters$predictors, levels = imp.sort_clusters$predictors)
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_clusters[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = predictors, y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important metabolites for classifying fecal samples into IMM antibiotic treatment")
+```
+
+Random forest FOR COMPONENTS
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq_Component)) 
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq_Component)$Time_tx)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.components <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.components)
+```
+
+```{r fig.height=4}
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.components)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_components <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_components$predictors <- factor(imp.sort_components$predictors, levels = imp.sort_components$predictors)
+
+#Adding component number based on id table
+library(purrr)
+library(stringr)
+imp.sort_components <- imp.sort_components%>% 
+   mutate(Cluster_ID = map_chr(predictors, ~str_replace(.x, 
+                                         pattern = "Cluster.", 
+                                         replacement = "Cluster ")))
+
+imp.sort_components <- merge(imp.sort_components,taxonomy_df, by="Cluster_ID") %>% 
+  dplyr::select(Component,`Day..1`,`Week.1`,`Week.9`,MeanDecreaseAccuracy,MeanDecreaseGini) %>% arrange(desc(MeanDecreaseAccuracy))
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_components[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = reorder(Component, -MeanDecreaseAccuracy), y = MeanDecreaseAccuracy)) + labs(x="Component")+
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important metabolites for classifying fecal samples into IMM antibiotic treatment")
+```
+```{r}
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis/tables/nonpolar/differential_analyzes")
+
+library(xlsx)
+write.xlsx(imp.sort_clusters, file="nonpolar_time_diff.xlsx", sheetName="randomForest_clust", row.names=FALSE)
+write.xlsx(imp.sort_components, file="nonpolar_time_diff.xlsx", sheetName="randomForest_compo", append=TRUE, row.names=FALSE)
+```
+#Exporting physeq as dataframe
+```{r}
+physeq_component_df <- psmelt(physeq_Component) 
+physeq_cluster_df <- psmelt(physeq) 
+```
+
+```{r}
+imp.50_component <- imp.sort_components[1:50, ]
+imp.50_clusters <- imp.sort_clusters[1:50, ]
+imp.50_clusters <- imp.50_clusters %>% mutate(predictors = gsub("Cluster.|\\.\\d+[A-Za-z]+", "Cluster ", predictors)) 
+ps.clust.randomforest <- prune_taxa(imp.50_clusters$predictors, physeq)
+ps.comp.randomforest <- prune_taxa(imp.50_component$Component, physeq_Component)
+```
+
+```{r}
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis/tables/nonpolar/differential_analyzes")
+
+physeq_component_df <- psmelt(ps.comp.randomforest) 
+physeq_cluster_df <- psmelt(ps.clust.randomforest) 
+
+write.csv(physeq_cluster_df,file = "nonpolar_physeq_clusterRF_relab.csv")
+
+write.csv(physeq_component_df,file = "nonpolar_physeq_componentRF_relab.csv")
+```
+
+
+
+#Alpha diversity
+```{r}
+alpha_diversity <- estimate_richness(physeq_nocontrols, 
+                                     measures = c("Shannon", "Observed"))
+alpha <- data.frame(alpha_diversity, sample_data(physeq_nocontrols))
+alpha <- reshape2::melt(alpha, measure.var=c("Shannon","Observed"),id.vars=c("Treatment","Time_tx","Group_Sampling","sample_name","study_ID"))
+alpha$value = as.numeric(alpha$value)
+```
+
+##Shannon
+###Stats: Friedman Test and Wilcoxon
+```{r}
+library(rstatix)
+shannon <- alpha %>% filter(variable%in%"Shannon")
+#Calculating p-value for the variation over time
+stat.test_time <- shannon %>% filter(study_ID %notin% "MA029") %>% 
+  friedman_test(value ~ Time_tx | study_ID)
+stat.test_time
+
+#Calculating p-values between treatments by time point
+stat.test1 <- shannon %>%  filter(Time_tx %in% c("Day -1")) %>%
+  group_by(Time_tx) %>%
+  wilcox_test(value ~ Treatment, alternative = "greater") %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "Time_tx", dodge = 0.8)
+stat.test1
+stat.test2 <- shannon %>%  filter(Time_tx %in% c("Week 1","Week 9")) %>%
+  group_by(Time_tx) %>%
+  wilcox_test(value ~ Treatment, alternative = "less") %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "Time_tx", dodge = 0.8)
+stat.test2
+```
+###Boxplot
+```{r}
+library(ggpubr)
+library(ggsci)
+
+#Boxplot of Shannon diversity between treatment groups over time
+shannon_nonpolar = ggboxplot(shannon,x = "Time_tx", y = "value", color = "Treatment", palette = "aaas", fill = "Treatment", add = c("jitter"), notch = F, outlier.shape = NA, facet.by = "variable", panel.labs = list(variable=c("Nonpolar","Ob"))) +
+  labs(x = "Time to treatment", y = "Shannon index") + 
+  scale_fill_aaas(alpha = 0.5) +
+#  ylim(3,9)+
+  stat_pvalue_manual(stat.test1,  label = "p", tip.length = 0) + 
+  stat_pvalue_manual(stat.test2,  label = "p", tip.length = 0) +
+  annotate("text", x = 2, y = 7.1, 
+           label = expression(paste("Friedman test, ", paste(italic('p'))," = 0.0021"))) +
+  geom_signif(aes(y = value, x = Time_tx),
+              comparisons = list(c("Day -1","Week 1"),c("Week 1","Week 9"),c("Day -1","Week 9")), 
+              test = "wilcox.test", test.args = c(alternative = "greater"),  y_position = c(6.5,6.6,6.8), 
+              color = "gray35", tip_length = 0.02)  +
+  theme(axis.title.x = element_blank())
+shannon_nonpolar
+```
+
+##Observed
+###Stats: Friedman Test and Wilcoxon
+```{r}
+library(rstatix)
+Observed <- alpha %>% filter(variable%in%"Observed")
+#Calculating p-value for the variation over time
+stat.test_time <- Observed %>% filter(study_ID %notin% "MA029") %>% 
+  friedman_test(value ~ Time_tx | study_ID)
+stat.test_time
+
+#Calculating p-values between treatments by time point
+stat.test <- Observed %>%  
+  group_by(Time_tx) %>%
+  wilcox_test(value ~ Treatment, alternative = "greater") %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance("p.adj") %>%
+  add_xy_position(x = "Time_tx", dodge = 0.8)
+stat.test
+```
+###Boxplot
+```{r}
+library(ggpubr)
+library(ggsci)
+
+#Boxplot of Observed diversity between treatment groups over time
+observed_nonpolar = ggboxplot(Observed,x = "Time_tx", y = "value", color = "Treatment", palette = "aaas", fill = "Treatment", add = c("jitter"), notch = F, outlier.shape = NA, facet.by = "variable", panel.labs = list(variable=c("Nonpolar","Nonpolar"))) +
+  labs(x = "Time to treatment", y = "Observed") + 
+  scale_fill_aaas(alpha = 0.5) +
+#  ylim(3,9)+
+  stat_pvalue_manual(stat.test,  label = "p", tip.length = 0) +
+  annotate("text", x = 2, y = 10.4E3, 
+           label = expression(paste("Friedman test, ", paste(italic('p'))," = 0.00025"))) +
+  geom_signif(aes(y = value, x = Time_tx),
+              comparisons = list(c("Day -1","Week 1"),c("Day -1","Week 9"),c("Week 9","Week 1")), 
+              test = "wilcox.test", test.args = c(alternative="greater"), y_position = c(10E3,10.2E3,10.1E3), 
+              color = "gray35", tip_length = 0.02)  +
+  theme(axis.title.x = element_blank())
+observed_nonpolar
+```
+#Beta diversity
+##PERMANOVA
+```{r}
+beta <-betatest(physeq_nocontrols_relab,group="Group_Sampling")
+beta
+```
+##Bray-Curtis plot
+```{r}
+bray_nonpolar <- plotbeta(
+  physeq_nocontrols_relab,
+  group="Group_Sampling",
+  shape = "Treatment",
+  distance = "bray",
+  method = "PCoA",
+  color = NULL,
+  size = 3,
+  ellipse = TRUE) + 
+  labs(color = "Group", shape = "Treatment") + 
+  annotate("text", x = 0.1, y = 0.18, label = expression(paste("PERMANOVA, ",F ,"= 6.59, ",paste(italic('p')),"=0.001")), colour = "black", size = 4) + ggtitle("Nonpolar")
+  theme_bw()
+bray_nonpolar
+```
+#Export diversity figures
+```{r fig.height=5}
+library(ggpubr)
+alpha_plots <- ggarrange(shannon_boxplot, Observed_boxplot, labels = c("A","B"), nrow = 1, common.legend = T)
+diversity_plots <- ggarrange(alpha_plots, beta_plot, labels = c("","C"), nrow = 2, ncol = 1)
+diversity_plots
+```
+```{r}
+setwd("/Users/karlavasco/Documents/figures")
+ggsave(plot=diversity_plots,"non_polar_diversity_plots.png", height = 10,width = 10)
+```
+
+#Aggregate phyloseq objects
+##Aggregate samples by time points
+```{r}
+`%notin%` <- Negate(`%in%`)
+physeq_day1 <- subset_samples(physeq_nocontrols_relab, Time_tx%in%"Day -1")
+physeq_week1 <- subset_samples(physeq_nocontrols_relab, Time_tx%in%c("Week 1"))
+physeq_week9 <- subset_samples(physeq_nocontrols_relab, Time_tx%in%c("Week 9"))
+```
+
+##Aggregate metabolite clusters by components
+```{r}
+#Aggregate genes by Components
+Component = tax_glom(physeq_nocontrols_relab, "Component")
+
+#Component Aggregate Component by time point
+Component_d1 = subset_samples(Component, Time_tx %in% "Day -1")
+Component_w1 = subset_samples(Component, Time_tx %in% "Week 1")
+Component_w9 = subset_samples(Component, Time_tx %in% "Week 9")
+```
+
+#Beta diversity week1
+##PERMANOVA
+```{r}
+phy_w1_relab <- microbial::normalize(physeq_week1, method = "relative")
+beta_w1 <-betatest(phy_w1_relab,group="Treatment")
+beta_w1
+```
+
+#Biomarkers
+
+##Day -1
+```{r}
+physeq <- physeq_day1 #To compare clusters
+physeq_component <- Component_d1 #To compare components
+```
+
+###LEfSE
+```{r}
+lefse <- ldamarker(physeq, group="Treatment", pvalue = 0.05, normalize = T,method = "log2")
+lefse_sigtab <- lefse[which(lefse$p.value<0.05), ]
+lefse_sigtab <- lefse_sigtab %>% select(rank, direction,tax, LDAscore, p.value, p.adj) %>% arrange(tax)
+lefse_sigtab
+```
+
+Plot LEfSE
+```{r}
+plotLDA(
+  lefse,
+  group=c("Antibiotic","Control"),
+  lda = 2,
+  pvalue = 0.01,
+  padj = NULL,
+  color = NULL,
+  fontsize.x = 4,
+  fontsize.y = 5
+)
+```
+
+###Random forest 
+CLUSTERS
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq))
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq)$Treatment)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.clusters <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.clusters)
+```
+
+```{r fig.height=4}
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.clusters)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_clusters <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_clusters$predictors <- factor(imp.sort_clusters$predictors, levels = imp.sort_clusters$predictors)
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_clusters[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = predictors, y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important metabolites for classifying fecal samples into IMM antibiotic treatment")
+```
+
+Random forest FOR COMPONENTS
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq_component)) 
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq_component)$Treatment)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.components <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.components)
+```
+
+```{r fig.height=4}
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.components)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_components <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_components$predictors <- factor(imp.sort_components$predictors, levels = imp.sort_components$predictors)
+
+#Adding component number based on id table
+library(purrr)
+library(stringr)
+imp.sort_components <- imp.sort_components%>% 
+   mutate(Cluster_ID = map_chr(predictors, ~str_replace(.x, 
+                                         pattern = "Cluster.", 
+                                         replacement = "Cluster ")))
+
+imp.sort_components <- merge(imp.sort_components,taxonomy_df, by="Cluster_ID") %>% 
+  select(Component,Control,Antibiotic,MeanDecreaseAccuracy,MeanDecreaseGini) %>% arrange(desc(MeanDecreaseAccuracy))
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_components[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = reorder(Component, -MeanDecreaseAccuracy), y = MeanDecreaseAccuracy)) + labs(x="Component")+
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important metabolites for classifying fecal samples into IMM antibiotic treatment")
+```
+
+###ANCOM
+Clusters
+```{r}
+library(nloptr)
+library(ANCOMBC)
+#ANCOMBC analysis comparison between treatment groups
+out = ancombc(phyloseq = physeq, formula = "Treatment",
+              p_adj_method = "holm", zero_cut = 0.90, lib_cut = 0,
+              group = "Treatment", struc_zero = F, neg_lb = FALSE,
+              tol = 1e-05, max_iter = 100, conserve = TRUE,
+              alpha = 0.05, global = TRUE)
+
+#ANCOMBC results as a list
+res = out$res
+
+#ANCOMBC results as a table
+ancom_results = res %>% as_tibble()
+
+#Filtering only significant results
+ancom_signif_list <- ancom_results %>% filter(p_val <= 0.05)
+
+#Adding feature names to the table
+ancom_signif_names <- data.frame(sapply(ancom_signif_list,c)) 
+row.names(ancom_signif_names) <- rownames(ancom_signif_list$beta) 
+ancom_signif_names <- tibble::rownames_to_column(ancom_signif_names, "Cluster_ID")
+ancom_clusters <- merge(taxonomy_df,ancom_signif_names,by.x = "Cluster_ID")
+```
+
+ANCOM for components
+```{r}
+library(nloptr)
+library(ANCOMBC)
+#ANCOMBC analysis comparison between treatment groups
+out = ancombc(phyloseq = physeq_component, formula = "Treatment",
+              p_adj_method = "holm", zero_cut = 0.90, lib_cut = 0,
+              group = "Treatment", struc_zero = F, neg_lb = FALSE,
+              tol = 1e-05, max_iter = 100, conserve = TRUE,
+              alpha = 0.05, global = TRUE)
+
+#ANCOMBC results as a list
+res = out$res
+
+#ANCOMBC results as a table
+ancom_results = res %>% as_tibble()
+
+#Filtering only significant results
+ancom_signif_list <- ancom_results %>% filter(p_val <= 0.05)
+
+#Adding feature names to the table
+ancom_signif_names <- data.frame(sapply(ancom_signif_list,c)) 
+row.names(ancom_signif_names) <- rownames(ancom_signif_list$beta) 
+ancom_signif_names <- tibble::rownames_to_column(ancom_signif_names, "Cluster_ID")
+ancom_components <- merge(taxonomy_df,ancom_signif_names,by.x = "Cluster_ID") %>% select(Component,17:22)
+```
+
+```{r}
+setwd("/Users/karlavasco/Documents/nonpolar")
+
+library(xlsx)
+write.xlsx(as.data.frame(lefse_sigtab), file="nonpolar_day1_treatment_diff.xlsx", sheetName="lefse", row.names=FALSE)
+write.xlsx(imp.sort_clusters, file="nonpolar_day1_treatment_diff.xlsx", sheetName="randomForest_clust", append=TRUE, row.names=FALSE)
+write.xlsx(imp.sort_components, file="nonpolar_day1_treatment_diff.xlsx", sheetName="randomForest_compo", append=TRUE, row.names=FALSE)
+write.xlsx(ancom_clusters, file="nonpolar_day1_treatment_diff.xlsx", sheetName="ancom_clusters", append=TRUE, row.names=FALSE)
+write.xlsx(ancom_components, file="nonpolar_day1_treatment_diff.xlsx", sheetName="ancom_components", append=TRUE, row.names=FALSE)
+```
+###MaAsLin2
+Clusters
+```{r}
+library(Maaslin2)
+setwd("/Users/karlavasco/Documents/nonpolar")
+
+fit_data = Maaslin2(
+  input_data = merge(physeq@tax_table,data.frame(otu_table(physeq)), by = 0) %>% remove_rownames %>% column_to_rownames(var="Cluster")  %>% select(4:43),
+  input_metadata = meta(physeq),
+  output = 'maaslin2_cluster_day1',
+  fixed_effects = c('Treatment'),
+  min_prevalence = 0.01,
+  min_abundance =  0.0,
+  standardize = T
+)
+```
+Components
+```{r}
+library(Maaslin2)
+setwd("/Users/karlavasco/Documents/nonpolar")
+
+fit_data = Maaslin2(
+  input_data = merge(physeq_component@tax_table,data.frame(otu_table(physeq_component)), by = 0) %>% remove_rownames %>% column_to_rownames(var="Component")  %>% select(4:43),
+  input_metadata = meta(physeq_component),
+  output = 'maaslin2_component_day1',
+  fixed_effects = c('Treatment'),
+  min_prevalence = 0.01,
+  min_abundance =  0.0,
+  standardize = T
+)
+```
+
+##Week 1
+```{r}
+physeq <- physeq_week1 #To compare clusters
+physeq_component <- Component_w1 #To compare components
+```
+
+###LEfSE
+```{r}
+lefse <- ldamarker(physeq, group="Treatment", pvalue = 0.05, normalize = T,method = "log2")
+lefse_sigtab <- lefse[which(lefse$p.value<0.05), ]
+lefse_sigtab <- lefse_sigtab %>% select(rank, direction,tax, LDAscore, p.value, p.adj) %>% arrange(tax)
+lefse_sigtab
+```
+
+Plot LEfSE
+```{r}
+plotLDA(
+  lefse,
+  group=c("Antibiotic","Control"),
+  lda = 2,
+  pvalue = 0.01,
+  padj = NULL,
+  color = NULL,
+  fontsize.x = 4,
+  fontsize.y = 5
+)
+```
+
+###Random forest 
+CLUSTERS
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq))
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq)$Treatment)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.clusters <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.clusters)
+```
+
+```{r fig.height=4}
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.clusters)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_clusters <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_clusters$predictors <- factor(imp.sort_clusters$predictors, levels = imp.sort_clusters$predictors)
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_clusters[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = predictors, y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important metabolites for classifying fecal samples into IMM antibiotic treatment")
+```
+
+Random forest FOR COMPONENTS
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq_component)) 
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq_component)$Treatment)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.components <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.components)
+```
+
+```{r fig.height=4}
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.components)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_components <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_components$predictors <- factor(imp.sort_components$predictors, levels = imp.sort_components$predictors)
+
+#Adding component number based on id table
+library(purrr)
+library(stringr)
+imp.sort_components <- imp.sort_components%>% 
+   mutate(Cluster_ID = map_chr(predictors, ~str_replace(.x, 
+                                         pattern = "Cluster.", 
+                                         replacement = "Cluster ")))
+
+imp.sort_components <- merge(imp.sort_components,taxonomy_df, by="Cluster_ID") %>% 
+  select(Component,Control,Antibiotic,MeanDecreaseAccuracy,MeanDecreaseGini) %>% arrange(desc(MeanDecreaseAccuracy))
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_components[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = reorder(Component, -MeanDecreaseAccuracy), y = MeanDecreaseAccuracy)) + labs(x="Component")+
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important metabolites for classifying fecal samples into IMM antibiotic treatment")
+```
+
+###ANCOM
+Clusters
+```{r}
+library(nloptr)
+library(ANCOMBC)
+#ANCOMBC analysis comparison between treatment groups
+out = ancombc(phyloseq = physeq, formula = "Treatment",
+              p_adj_method = "holm", zero_cut = 0.90, lib_cut = 0,
+              group = "Treatment", struc_zero = F, neg_lb = FALSE,
+              tol = 1e-05, max_iter = 100, conserve = TRUE,
+              alpha = 0.05, global = TRUE)
+
+#ANCOMBC results as a list
+res = out$res
+
+#ANCOMBC results as a table
+ancom_results = res %>% as_tibble()
+
+#Filtering only significant results
+ancom_signif_list <- ancom_results %>% filter(p_val <= 0.05)
+
+#Adding feature names to the table
+ancom_signif_names <- data.frame(sapply(ancom_signif_list,c)) 
+row.names(ancom_signif_names) <- rownames(ancom_signif_list$beta) 
+ancom_signif_names <- tibble::rownames_to_column(ancom_signif_names, "Cluster_ID")
+ancom_clusters <- merge(taxonomy_df,ancom_signif_names,by.x = "Cluster_ID")
+```
+
+ANCOM for components
+```{r}
+library(nloptr)
+library(ANCOMBC)
+#ANCOMBC analysis comparison between treatment groups
+out = ancombc(phyloseq = physeq_component, formula = "Treatment",
+              p_adj_method = "holm", zero_cut = 0.90, lib_cut = 0,
+              group = "Treatment", struc_zero = F, neg_lb = FALSE,
+              tol = 1e-05, max_iter = 100, conserve = TRUE,
+              alpha = 0.05, global = TRUE)
+
+#ANCOMBC results as a list
+res = out$res
+
+#ANCOMBC results as a table
+ancom_results = res %>% as_tibble()
+
+#Filtering only significant results
+ancom_signif_list <- ancom_results %>% filter(p_val <= 0.05)
+
+#Adding feature names to the table
+ancom_signif_names <- data.frame(sapply(ancom_signif_list,c)) 
+row.names(ancom_signif_names) <- rownames(ancom_signif_list$beta) 
+ancom_signif_names <- tibble::rownames_to_column(ancom_signif_names, "Cluster_ID")
+ancom_components <- merge(taxonomy_df,ancom_signif_names,by.x = "Cluster_ID") %>% select(Component,17:22)
+```
+
+```{r}
+setwd("/Users/karlavasco/Documents/nonpolar")
+
+library(xlsx)
+write.xlsx(as.data.frame(lefse_sigtab), file="nonpolar_week1_treatment_diff.xlsx", sheetName="lefse", row.names=FALSE)
+write.xlsx(imp.sort_clusters, file="nonpolar_week1_treatment_diff.xlsx", sheetName="randomForest_clust", append=TRUE, row.names=FALSE)
+write.xlsx(imp.sort_components, file="nonpolar_week1_treatment_diff.xlsx", sheetName="randomForest_compo", append=TRUE, row.names=FALSE)
+write.xlsx(ancom_clusters, file="nonpolar_week1_treatment_diff.xlsx", sheetName="ancom_clusters", append=TRUE, row.names=FALSE)
+write.xlsx(ancom_components, file="nonpolar_week1_treatment_diff.xlsx", sheetName="ancom_components", append=TRUE, row.names=FALSE)
+```
+###MaAsLin2
+Clusters
+```{r}
+library(Maaslin2)
+setwd("/Users/karlavasco/Documents/nonpolar")
+
+fit_data = Maaslin2(
+  input_data = merge(physeq@tax_table,data.frame(otu_table(physeq)), by = 0) %>% remove_rownames %>% column_to_rownames(var="Cluster")  %>% select(4:43),
+  input_metadata = meta(physeq),
+  output = 'maaslin2_cluster_week1',
+  fixed_effects = c('Treatment'),
+  min_prevalence = 0.01,
+  min_abundance =  0.0,
+  standardize = T
+)
+```
+Components
+```{r}
+library(Maaslin2)
+setwd("/Users/karlavasco/Documents/nonpolar")
+
+fit_data = Maaslin2(
+  input_data = merge(physeq_component@tax_table,data.frame(otu_table(physeq_component)), by = 0) %>% remove_rownames %>% column_to_rownames(var="Component")  %>% select(4:43),
+  input_metadata = meta(physeq_component),
+  output = 'maaslin2_component_week1',
+  fixed_effects = c('Treatment'),
+  min_prevalence = 0.01,
+  min_abundance =  0.0,
+  standardize = T
+)
+```
+
+##Week 9
+```{r}
+physeq <- physeq_week9 #To compare clusters
+physeq_component <- Component_w9 #To compare components
+```
+
+###LEfSE
+```{r}
+lefse <- ldamarker(physeq, group="Treatment", pvalue = 0.05, normalize = T,method = "log2")
+lefse_sigtab <- lefse[which(lefse$p.value<0.05), ]
+lefse_sigtab <- lefse_sigtab %>% select(rank, direction,tax, LDAscore, p.value, p.adj) %>% arrange(tax)
+lefse_sigtab
+```
+
+Plot LEfSE
+```{r}
+plotLDA(
+  lefse,
+  group=c("Antibiotic","Control"),
+  lda = 2,
+  pvalue = 0.01,
+  padj = NULL,
+  color = NULL,
+  fontsize.x = 4,
+  fontsize.y = 5
+)
+```
+
+###Random forest 
+CLUSTERS
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq))
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq)$Treatment)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.clusters <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.clusters)
+```
+
+```{r fig.height=4}
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.clusters)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_clusters <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_clusters$predictors <- factor(imp.sort_clusters$predictors, levels = imp.sort_clusters$predictors)
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_clusters[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = predictors, y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important metabolites for classifying fecal samples into IMM antibiotic treatment")
+```
+
+Random forest FOR COMPONENTS
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq_component)) 
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq_component)$Treatment)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.components <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.components)
+```
+
+```{r fig.height=4}
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.components)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_components <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_components$predictors <- factor(imp.sort_components$predictors, levels = imp.sort_components$predictors)
+
+#Adding component number based on id table
+library(purrr)
+library(stringr)
+imp.sort_components <- imp.sort_components%>% 
+   mutate(Cluster_ID = map_chr(predictors, ~str_replace(.x, 
+                                         pattern = "Cluster.", 
+                                         replacement = "Cluster ")))
+
+imp.sort_components <- merge(imp.sort_components,taxonomy_df, by="Cluster_ID") %>% 
+  select(Component,Control,Antibiotic,MeanDecreaseAccuracy,MeanDecreaseGini) %>% arrange(desc(MeanDecreaseAccuracy))
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_components[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = reorder(Component, -MeanDecreaseAccuracy), y = MeanDecreaseAccuracy)) + labs(x="Component")+
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important metabolites for classifying fecal samples into IMM antibiotic treatment")
+```
+
+###ANCOM
+Clusters
+```{r}
+library(nloptr)
+library(ANCOMBC)
+#ANCOMBC analysis comparison between treatment groups
+out = ancombc(phyloseq = physeq, formula = "Treatment",
+              p_adj_method = "holm", zero_cut = 0.90, lib_cut = 0,
+              group = "Treatment", struc_zero = F, neg_lb = FALSE,
+              tol = 1e-05, max_iter = 100, conserve = TRUE,
+              alpha = 0.05, global = TRUE)
+
+#ANCOMBC results as a list
+res = out$res
+
+#ANCOMBC results as a table
+ancom_results = res %>% as_tibble()
+
+#Filtering only significant results
+ancom_signif_list <- ancom_results %>% filter(p_val <= 0.05)
+
+#Adding feature names to the table
+ancom_signif_names <- data.frame(sapply(ancom_signif_list,c)) 
+row.names(ancom_signif_names) <- rownames(ancom_signif_list$beta) 
+ancom_signif_names <- tibble::rownames_to_column(ancom_signif_names, "Cluster_ID")
+ancom_clusters <- merge(taxonomy_df,ancom_signif_names,by.x = "Cluster_ID")
+```
+
+ANCOM for components
+```{r}
+library(nloptr)
+library(ANCOMBC)
+#ANCOMBC analysis comparison between treatment groups
+out = ancombc(phyloseq = physeq_component, formula = "Treatment",
+              p_adj_method = "holm", zero_cut = 0.90, lib_cut = 0,
+              group = "Treatment", struc_zero = F, neg_lb = FALSE,
+              tol = 1e-05, max_iter = 100, conserve = TRUE,
+              alpha = 0.05, global = TRUE)
+
+#ANCOMBC results as a list
+res = out$res
+
+#ANCOMBC results as a table
+ancom_results = res %>% as_tibble()
+
+#Filtering only significant results
+ancom_signif_list <- ancom_results %>% filter(p_val <= 0.05)
+
+#Adding feature names to the table
+ancom_signif_names <- data.frame(sapply(ancom_signif_list,c)) 
+row.names(ancom_signif_names) <- rownames(ancom_signif_list$beta) 
+ancom_signif_names <- tibble::rownames_to_column(ancom_signif_names, "Cluster_ID")
+ancom_components <- merge(taxonomy_df,ancom_signif_names,by.x = "Cluster_ID") %>% select(Component,17:22)
+```
+
+###Exporting files to excel
+```{r}
+setwd("/Users/karlavasco/Documents/nonpolar")
+
+library(xlsx)
+write.xlsx(as.data.frame(lefse_sigtab), file="nonpolar_week9_treatment_diff.xlsx", sheetName="lefse", row.names=FALSE)
+write.xlsx(imp.sort_clusters, file="nonpolar_week9_treatment_diff.xlsx", sheetName="randomForest_clust", append=TRUE, row.names=FALSE)
+write.xlsx(imp.sort_components, file="nonpolar_week9_treatment_diff.xlsx", sheetName="randomForest_compo", append=TRUE, row.names=FALSE)
+write.xlsx(ancom_clusters, file="nonpolar_week9_treatment_diff.xlsx", sheetName="ancom_clusters", append=TRUE, row.names=FALSE)
+write.xlsx(ancom_components, file="nonpolar_week9_treatment_diff.xlsx", sheetName="ancom_components", append=TRUE, row.names=FALSE)
+```
+
+###MaAsLin2
+Clusters
+```{r}
+library(Maaslin2)
+setwd("/Users/karlavasco/Documents/nonpolar")
+
+fit_data = Maaslin2(
+  input_data = merge(physeq@tax_table,data.frame(otu_table(physeq)), by = 0) %>% remove_rownames %>% column_to_rownames(var="Cluster")  %>% select(4:42),
+  input_metadata = meta(physeq),
+  output = 'maaslin2_cluster_week9',
+  fixed_effects = c('Treatment'),
+  min_prevalence = 0.01,
+  min_abundance =  0.0,
+  standardize = T
+)
+```
+Components
+```{r}
+library(Maaslin2)
+setwd("/Users/karlavasco/Documents/nonpolar")
+
+fit_data = Maaslin2(
+  input_data = merge(physeq_component@tax_table,data.frame(otu_table(physeq_component)), by = 0) %>% remove_rownames %>% column_to_rownames(var="Component")  %>% select(4:42),
+  input_metadata = meta(physeq_component),
+  output = 'maaslin2_component_week9',
+  fixed_effects = c('Treatment'),
+  min_prevalence = 0.01,
+  min_abundance =  0.0,
+  standardize = T
+)
+```
+
+#COMPARISONS BETWEEN TIME POINTS
+
+##Aggregate samples by time points
+```{r}
+`%notin%` <- Negate(`%in%`)
+physeq_d1_w1 <- subset_samples(physeq_nocontrols_relab, Time_tx%in%c("Day -1","Week 1"))
+physeq_d1_w9 <- subset_samples(physeq_nocontrols_relab, Time_tx%in%c("Day -1","Week 9"))
+physeq_w1_w9 <- subset_samples(physeq_nocontrols_relab, Time_tx%in%c("Week 1","Week 9"))
+```
+
+##Aggregate metabolite clusters by components
+```{r}
+#Component Aggregate Component by time point
+Component_d1_w1 = subset_samples(Component, Time_tx %in% c("Day -1","Week 1"))
+Component_d1_w9 = subset_samples(Component, Time_tx %in%c("Day -1","Week 9"))
+Component_w1_w9 = subset_samples(Component, Time_tx %in% c("Week 1","Week 9"))
+```
+
+##DAY 1 VS WEEK 1
+```{r}
+physeq <- physeq_d1_w1 #To compare clusters
+physeq_component <- Component_d1_w1 #To compare components
+```
+
+###LEfSE
+```{r}
+lefse <- ldamarker(physeq, group="Time_tx", pvalue = 0.05, normalize = T,method = "log2")
+lefse_sigtab <- lefse[which(lefse$p.value<0.05), ]
+lefse_sigtab <- lefse_sigtab %>% select(rank, direction,tax, LDAscore, p.value, p.adj) %>% arrange(tax)
+lefse_sigtab
+```
+
+Plot LEfSE
+```{r}
+plotLDA(
+  lefse,
+  group=c("Day -1","Week 1"),
+  lda = 2,
+  pvalue = 0.01,
+  padj = NULL,
+  color = NULL,
+  fontsize.x = 4,
+  fontsize.y = 5
+)
+```
+
+###Random forest 
+CLUSTERS
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq))
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq)$Time_tx)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.clusters <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.clusters)
+```
+
+```{r fig.height=4}
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.clusters)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_clusters <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_clusters$predictors <- factor(imp.sort_clusters$predictors, levels = imp.sort_clusters$predictors)
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_clusters[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = predictors, y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important metabolites for classifying fecal samples into IMM antibiotic Time_tx")
+```
+
+Random forest FOR COMPONENTS
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq_component)) 
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq_component)$Time_tx)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.components <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.components)
+```
+
+```{r fig.height=4}
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.components)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_components <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_components$predictors <- factor(imp.sort_components$predictors, levels = imp.sort_components$predictors)
+
+#Adding component number based on id table
+library(purrr)
+library(stringr)
+imp.sort_components <- imp.sort_components%>% 
+   mutate(Cluster_ID = map_chr(predictors, ~str_replace(.x, 
+                                         pattern = "Cluster.", 
+                                         replacement = "Cluster ")))
+
+imp.sort_components <- merge(imp.sort_components,taxonomy_df, by="Cluster_ID") %>% 
+  select(Component,Day..1,Week.1,MeanDecreaseAccuracy,MeanDecreaseGini) %>% arrange(desc(MeanDecreaseAccuracy))
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_components[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = reorder(Component, -MeanDecreaseAccuracy), y = MeanDecreaseAccuracy)) + labs(x="Component")+
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important metabolites for classifying fecal samples into IMM antibiotic Time_tx")
+```
+
+###ANCOM
+Clusters
+```{r}
+library(nloptr)
+library(ANCOMBC)
+#ANCOMBC analysis comparison between Time_tx groups
+out = ancombc(phyloseq = physeq, formula = "Time_tx",
+              p_adj_method = "holm", zero_cut = 0.90, lib_cut = 0,
+              group = "Time_tx", struc_zero = F, neg_lb = FALSE,
+              tol = 1e-05, max_iter = 100, conserve = TRUE,
+              alpha = 0.05, global = TRUE)
+
+#ANCOMBC results as a list
+res = out$res
+
+#ANCOMBC results as a table
+ancom_results = res %>% as_tibble()
+
+#Filtering only significant results
+ancom_signif_list <- ancom_results %>% filter(p_val <= 0.05)
+
+#Adding feature names to the table
+ancom_signif_names <- data.frame(sapply(ancom_signif_list,c)) 
+row.names(ancom_signif_names) <- rownames(ancom_signif_list$beta) 
+ancom_signif_names <- tibble::rownames_to_column(ancom_signif_names, "Cluster_ID")
+ancom_clusters <- merge(taxonomy_df,ancom_signif_names,by.x = "Cluster_ID")
+```
+
+ANCOM for components
+```{r}
+library(nloptr)
+library(ANCOMBC)
+#ANCOMBC analysis comparison between Time_tx groups
+out = ancombc(phyloseq = physeq_component, formula = "Time_tx",
+              p_adj_method = "holm", zero_cut = 0.90, lib_cut = 0,
+              group = "Time_tx", struc_zero = F, neg_lb = FALSE,
+              tol = 1e-05, max_iter = 100, conserve = TRUE,
+              alpha = 0.05, global = TRUE)
+
+#ANCOMBC results as a list
+res = out$res
+
+#ANCOMBC results as a table
+ancom_results = res %>% as_tibble()
+
+#Filtering only significant results
+ancom_signif_list <- ancom_results %>% filter(p_val <= 0.05)
+
+#Adding feature names to the table
+ancom_signif_names <- data.frame(sapply(ancom_signif_list,c)) 
+row.names(ancom_signif_names) <- rownames(ancom_signif_list$beta) 
+ancom_signif_names <- tibble::rownames_to_column(ancom_signif_names, "Cluster_ID")
+ancom_components <- merge(taxonomy_df,ancom_signif_names,by.x = "Cluster_ID") %>% select(Component,17:22)
+```
+
+###Exporting files to excel
+```{r}
+setwd("/Users/karlavasco/Documents/nonpolar")
+
+#library(xlsx)
+write.xlsx(as.data.frame(lefse_sigtab), file="nonpolar_d1_w1_Time_tx_diff.xlsx", sheetName="lefse", row.names=FALSE)
+write.xlsx(imp.sort_clusters, file="nonpolar_d1_w1_Time_tx_diff.xlsx", sheetName="randomForest_clust", append=TRUE, row.names=FALSE)
+write.xlsx(imp.sort_components, file="nonpolar_d1_w1_Time_tx_diff.xlsx", sheetName="randomForest_compo", append=TRUE, row.names=FALSE)
+write.xlsx(ancom_clusters, file="nonpolar_d1_w1_Time_tx_diff.xlsx", sheetName="ancom_clusters", append=TRUE, row.names=FALSE)
+write.xlsx(ancom_components, file="nonpolar_d1_w1_Time_tx_diff.xlsx", sheetName="ancom_components", append=TRUE, row.names=FALSE)
+```
+
+###MaAsLin2
+Clusters
+```{r}
+library(Maaslin2)
+setwd("/Users/karlavasco/Documents/nonpolar")
+
+fit_data = Maaslin2(
+  input_data = merge(physeq@tax_table,data.frame(otu_table(physeq)), by = 0) %>% remove_rownames %>% column_to_rownames(var="Cluster")  %>% select(4:83),
+  input_metadata = meta(physeq),
+  output = 'maaslin2_cluster_d1_w1',
+  fixed_effects = c('Time_tx'),
+  min_prevalence = 0.01,
+  min_abundance =  0.0,
+  standardize = T, plot_scatter = F
+)
+```
+Components
+```{r}
+library(Maaslin2)
+setwd("/Users/karlavasco/Documents/nonpolar")
+
+fit_data = Maaslin2(
+  input_data = merge(physeq_component@tax_table,data.frame(otu_table(physeq_component)), by = 0) %>% remove_rownames %>% column_to_rownames(var="Component")  %>% select(4:43),
+  input_metadata = meta(physeq_component),
+  output = 'maaslin2_component_d1_w1',
+  fixed_effects = c('Time_tx'),
+  min_prevalence = 0.01,
+  min_abundance =  0.0,
+  standardize = T, plot_scatter = F
+)
+```
+
+#DAY 1 VS WEEK 9
+```{r}
+physeq <- physeq_d1_w9 #To compare clusters
+physeq_component <- Component_d1_w9 #To compare components
+```
+
+###LEfSE
+```{r}
+lefse <- ldamarker(physeq, group="Time_tx", pvalue = 0.05, normalize = T,method = "log2")
+lefse_sigtab <- lefse[which(lefse$p.value<0.05), ]
+lefse_sigtab <- lefse %>% filter(LDAscore >=abs(2),p.value<=0.05) %>% select(rank, direction,tax, LDAscore, p.value, p.adj) %>% arrange(tax)
+lefse_sigtab
+```
+
+
+###Random forest 
+CLUSTERS
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq))
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq)$Time_tx)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.clusters <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.clusters)
+```
+
+```{r fig.height=4}
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.clusters)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_clusters <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_clusters$predictors <- factor(imp.sort_clusters$predictors, levels = imp.sort_clusters$predictors)
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_clusters[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = predictors, y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important metabolites for classifying fecal samples into IMM antibiotic Time_tx")
+```
+
+Random forest FOR COMPONENTS
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq_component)) 
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq_component)$Time_tx)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.components <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.components)
+```
+
+```{r fig.height=4}
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.components)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_components <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_components$predictors <- factor(imp.sort_components$predictors, levels = imp.sort_components$predictors)
+
+#Adding component number based on id table
+library(purrr)
+library(stringr)
+imp.sort_components <- imp.sort_components%>% 
+   mutate(Cluster_ID = map_chr(predictors, ~str_replace(.x, 
+                                         pattern = "Cluster.", 
+                                         replacement = "Cluster ")))
+
+imp.sort_components <- merge(imp.sort_components,taxonomy_df, by="Cluster_ID") %>% 
+  select(Component,Day..1,Week.9,MeanDecreaseAccuracy,MeanDecreaseGini) %>% arrange(desc(MeanDecreaseAccuracy))
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_components[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = reorder(Component, -MeanDecreaseAccuracy), y = MeanDecreaseAccuracy)) + labs(x="Component")+
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important metabolites for classifying fecal samples into IMM antibiotic Time_tx")
+```
+
+###ANCOM
+Clusters
+```{r}
+library(nloptr)
+library(ANCOMBC)
+#ANCOMBC analysis comparison between Time_tx groups
+out = ancombc(phyloseq = physeq, formula = "Time_tx",
+              p_adj_method = "holm", zero_cut = 0.90, lib_cut = 0,
+              group = "Time_tx", struc_zero = F, neg_lb = FALSE,
+              tol = 1e-05, max_iter = 100, conserve = TRUE,
+              alpha = 0.05, global = TRUE)
+
+#ANCOMBC results as a list
+res = out$res
+
+#ANCOMBC results as a table
+ancom_results = res %>% as_tibble()
+
+#Filtering only significant results
+ancom_signif_list <- ancom_results %>% filter(p_val <= 0.05)
+
+#Adding feature names to the table
+ancom_signif_names <- data.frame(sapply(ancom_signif_list,c)) 
+row.names(ancom_signif_names) <- rownames(ancom_signif_list$beta) 
+ancom_signif_names <- tibble::rownames_to_column(ancom_signif_names, "Cluster_ID")
+ancom_clusters <- merge(taxonomy_df,ancom_signif_names,by.x = "Cluster_ID")
+```
+
+ANCOM for components
+```{r}
+library(nloptr)
+library(ANCOMBC)
+#ANCOMBC analysis comparison between Time_tx groups
+out = ancombc(phyloseq = physeq_component, formula = "Time_tx",
+              p_adj_method = "holm", zero_cut = 0.90, lib_cut = 0,
+              group = "Time_tx", struc_zero = F, neg_lb = FALSE,
+              tol = 1e-05, max_iter = 100, conserve = TRUE,
+              alpha = 0.05, global = TRUE)
+
+#ANCOMBC results as a list
+res = out$res
+
+#ANCOMBC results as a table
+ancom_results = res %>% as_tibble()
+
+#Filtering only significant results
+ancom_signif_list <- ancom_results %>% filter(p_val <= 0.05)
+
+#Adding feature names to the table
+ancom_signif_names <- data.frame(sapply(ancom_signif_list,c)) 
+row.names(ancom_signif_names) <- rownames(ancom_signif_list$beta) 
+ancom_signif_names <- tibble::rownames_to_column(ancom_signif_names, "Cluster_ID")
+ancom_components <- merge(taxonomy_df,ancom_signif_names,by.x = "Cluster_ID") %>% select(Component,17:22)
+```
+
+###Exporting files to excel
+```{r}
+setwd("/Users/karlavasco/Documents/nonpolar")
+
+library(xlsx)
+write.xlsx(as.data.frame(lefse_sigtab), file="nonpolar_d1_week9_Time_tx_diff.xlsx", sheetName="lefse", row.names=FALSE)
+write.xlsx(imp.sort_clusters, file="nonpolar_d1_week9_Time_tx_diff.xlsx", sheetName="randomForest_clust", append=TRUE, row.names=FALSE)
+write.xlsx(imp.sort_components, file="nonpolar_d1_week9_Time_tx_diff.xlsx", sheetName="randomForest_compo", append=TRUE, row.names=FALSE)
+write.xlsx(ancom_clusters, file="nonpolar_d1_week9_Time_tx_diff.xlsx", sheetName="ancom_clusters", append=TRUE, row.names=FALSE)
+write.xlsx(ancom_components, file="/Users/karlavasco/Documents/nonpolar/nonpolar_d1_week9_Time_tx_diff.xlsx", sheetName="ancom_components", append=TRUE, row.names=FALSE)
+```
+
+###MaAsLin2
+Clusters
+```{r}
+library(Maaslin2)
+setwd("/Users/karlavasco/Documents/nonpolar")
+
+fit_data = Maaslin2(
+  input_data = merge(physeq@tax_table,data.frame(otu_table(physeq)), by = 0) %>% remove_rownames %>% column_to_rownames(var="Cluster")  %>% select(4:82),
+  input_metadata = meta(physeq),
+  output = 'maaslin2_cluster_d1_w9',
+  fixed_effects = c('Time_tx'),
+  min_prevalence = 0.01,
+  min_abundance =  0.0,
+  standardize = T, plot_scatter = F
+)
+```
+
+Components
+```{r}
+library(Maaslin2)
+setwd("/Users/karlavasco/Documents/nonpolar")
+
+fit_data = Maaslin2(
+  input_data = merge(physeq_component@tax_table,data.frame(otu_table(physeq_component)), by = 0) %>% remove_rownames %>% column_to_rownames(var="Component")  %>% select(4:82),
+  input_metadata = meta(physeq_component),
+  output = 'maaslin2_component_d1_w9',
+  fixed_effects = c('Time_tx'),
+  min_prevalence = 0.01,
+  min_abundance =  0.0,
+  standardize = T, plot_scatter = F
+)
+```
+```{r}
+physeq <- physeq_d1_w1 #To compare clusters
+physeq_component <- Component_d1_w1 #To compare components
+```
+
+#WEEK 1 VS WEEK 9
+```{r}
+physeq <- physeq_w1_w9 #To compare clusters
+physeq_component <- Component_w1_w9 #To compare components
+```
+
+###LEfSE
+```{r}
+lefse <- ldamarker(physeq, group="Time_tx", pvalue = 0.05, normalize = T,method = "log2")
+lefse_sigtab <- lefse %>% filter(LDAscore >=2, p.value <= 0.05) %>% select(rank, direction,tax, LDAscore, p.value, p.adj) %>% arrange(tax)
+lefse_sigtab
+```
+
+
+###Random forest 
+CLUSTERS
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq))
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq)$Time_tx)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.clusters <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.clusters)
+```
+
+```{r fig.height=4}
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.clusters, scale = F, type = 1)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_clusters <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_clusters$predictors <- factor(imp.sort_clusters$predictors, levels = imp.sort_clusters$predictors)
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_clusters[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = predictors, y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important metabolites for classifying fecal samples into IMM antibiotic Time_tx")
+```
+
+Random forest FOR COMPONENTS
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq_component)) 
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq_component)$Time_tx)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.components <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.components)
+```
+
+```{r fig.height=4}
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.components, scale = F)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_components <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_components$predictors <- factor(imp.sort_components$predictors, levels = imp.sort_components$predictors)
+
+#Adding component number based on id table
+library(purrr)
+library(stringr)
+imp.sort_components <- imp.sort_components%>% 
+   mutate(Cluster_ID = map_chr(predictors, ~str_replace(.x, 
+                                         pattern = "Cluster.", 
+                                         replacement = "Cluster ")))
+
+imp.sort_components <- merge(imp.sort_components,taxonomy_df, by="Cluster_ID") %>% 
+  select(Component,Week.1,Week.9,MeanDecreaseAccuracy,MeanDecreaseGini) %>% arrange(desc(MeanDecreaseAccuracy))
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_components[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = reorder(Component, -MeanDecreaseAccuracy), y = MeanDecreaseAccuracy)) + labs(x="Component")+
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important metabolites for classifying fecal samples into IMM antibiotic Time_tx")
+```
+
+###ANCOM
+Clusters
+```{r}
+library(nloptr)
+library(ANCOMBC)
+#ANCOMBC analysis comparison between Time_tx groups
+out = ancombc(phyloseq = physeq, formula = "Time_tx",
+              p_adj_method = "holm", zero_cut = 0.90, lib_cut = 0,
+              group = "Time_tx", struc_zero = F, neg_lb = FALSE,
+              tol = 1e-05, max_iter = 100, conserve = TRUE,
+              alpha = 0.05, global = TRUE)
+
+#ANCOMBC results as a list
+res = out$res
+
+#ANCOMBC results as a table
+ancom_results = res %>% as_tibble()
+
+#Filtering only significant results
+ancom_signif_list <- ancom_results %>% filter(p_val <= 0.05)
+
+#Adding feature names to the table
+ancom_signif_names <- data.frame(sapply(ancom_signif_list,c)) 
+row.names(ancom_signif_names) <- rownames(ancom_signif_list$beta) 
+ancom_signif_names <- tibble::rownames_to_column(ancom_signif_names, "Cluster_ID")
+ancom_clusters <- merge(taxonomy_df,ancom_signif_names,by.x = "Cluster_ID")
+```
+
+ANCOM for components
+```{r}
+library(nloptr)
+library(ANCOMBC)
+#ANCOMBC analysis comparison between Time_tx groups
+out = ancombc(phyloseq = physeq_component, formula = "Time_tx",
+              p_adj_method = "holm", zero_cut = 0.90, lib_cut = 0,
+              group = "Time_tx", struc_zero = F, neg_lb = FALSE,
+              tol = 1e-05, max_iter = 100, conserve = TRUE,
+              alpha = 0.05, global = TRUE)
+
+#ANCOMBC results as a list
+res = out$res
+
+#ANCOMBC results as a table
+ancom_results = res %>% as_tibble()
+
+#Filtering only significant results
+ancom_signif_list <- ancom_results %>% filter(p_val <= 0.05)
+
+#Adding feature names to the table
+ancom_signif_names <- data.frame(sapply(ancom_signif_list,c)) 
+row.names(ancom_signif_names) <- rownames(ancom_signif_list$beta) 
+ancom_signif_names <- tibble::rownames_to_column(ancom_signif_names, "Cluster_ID")
+ancom_components <- merge(taxonomy_df,ancom_signif_names,by.x = "Cluster_ID") %>% select(Component,17:22)
+```
+
+###Exporting files to excel
+```{r}
+setwd("/Users/karlavasco/Documents/nonpolar")
+
+library(xlsx)
+write.xlsx(as.data.frame(lefse_sigtab), file="nonpolar_w1_week9_Time_tx_diff.xlsx", sheetName="lefse", row.names=FALSE)
+write.xlsx(imp.sort_clusters, file="nonpolar_w1_week9_Time_tx_diff.xlsx", sheetName="randomForest_clust", append=TRUE, row.names=FALSE)
+write.xlsx(imp.sort_components, file="nonpolar_w1_week9_Time_tx_diff.xlsx", sheetName="randomForest_compo", append=TRUE, row.names=FALSE)
+write.xlsx(ancom_clusters, file="nonpolar_w1_week9_Time_tx_diff.xlsx", sheetName="ancom_clusters", append=TRUE, row.names=FALSE)
+write.xlsx(ancom_components, file="nonpolar_w1_week9_Time_tx_diff.xlsx", sheetName="ancom_components", append=TRUE, row.names=FALSE)
+```
+
+###MaAsLin2
+Clusters
+```{r}
+library(Maaslin2)
+setwd("/Users/karlavasco/Documents/nonpolar")
+
+fit_data = Maaslin2(
+  input_data = merge(physeq@tax_table,data.frame(otu_table(physeq)), by = 0) %>% remove_rownames %>% column_to_rownames(var="Cluster")  %>% select(4:82),
+  input_metadata = meta(physeq),
+  output = 'maaslin2_cluster_w1_week9',
+  fixed_effects = c('Time_tx'),
+  min_prevalence = 0.01,
+  min_abundance =  0.0,
+  standardize = T, plot_scatter = F
+)
+```
+Components
+```{r}
+library(Maaslin2)
+setwd("/Users/karlavasco/Documents/nonpolar")
+
+fit_data = Maaslin2(
+  input_data = merge(physeq_component@tax_table,data.frame(otu_table(physeq_component)), by = 0) %>% remove_rownames %>% column_to_rownames(var="Component")  %>% select(4:82),
+  input_metadata = meta(physeq_component),
+  output = 'maaslin2_component_w1_week9',
+  fixed_effects = c('Time_tx'),
+  min_prevalence = 0.01,
+  min_abundance =  0.0,
+  standardize = T, plot_scatter = F
+)
+```

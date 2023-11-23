@@ -1,0 +1,46 @@
+#!/bin/bash --login
+
+########## Define Resources Needed with SBATCH Lines ##########
+#SBATCH --job-name=humann3_5 # give your job a name for easier identification (same as -J)
+#SBATCH --time=168:00:00 # limit of wall clock time - how long will the job take to run? (same as -t)
+#SBATCH --ntasks=2     # number of tasks - how many tasks (nodes) does your job require? (same as -n)
+#SBATCH --cpus-per-task=4 # number of CPUs (or cores) per task (same as -c)
+#SBATCH --mem=100G     # memory required per node - amount of memory (in bytes)
+#SBATCH --output=/mnt/scratch/vascokar/marine_iguana/eofiles/humann3_5.%j.out #Standard output
+#SBATCH --error=/mnt/scratch/vascokar/marine_iguana/eofiles/humann3_5.%j.err #Standard error log
+
+########## Diplay the job context ######
+echo Job: $SLUM_JOB_NAME with ID $SLURM_JOB_ID
+echo Running on host `hostname`
+echo Job started at `date '+%T %a %d %b %Y'`
+echo Directory is `pwd`
+echo Using $SLURM_NTASKS processors across $SLURM_NNODES nodes
+
+######### Assign path variables ########
+INPUT_DIRECTORY=/mnt/scratch/vascokar/mastitis_study/cat_merge
+OUTPUT_DIRECTORY=/mnt/scratch/vascokar/mastitis_study/humann/raw_humann
+
+######### Modules to Load ##########
+module purge
+module load Conda/3
+
+########## Code to Run ###########
+export PATH=$PATH:$HOME/anaconda3/bin
+conda init bash
+conda activate biobakery3
+
+# Declare a string array with sequence IDs
+declare -a Samples=("19.1_S140_L006" "19.2_S141_L006" "19.5_S142_L006" "19.7_S143_L006" "2.1_S72_L006" "2.2_S73_L006" "2.5_S74_L006" "2.7_S75_L006" "20.1_S144_L006" "20.2_S145_L006")
+
+# Read the array values with space
+for val in "${Samples[@]}"; 
+do
+  n=${val%%} # strip file names
+
+humann --input $INPUT_DIRECTORY/${n}_merged.fastq --output $OUTPUT_DIRECTORY --output-basename ${n}
+done
+
+conda deactivate
+
+##### Final time stamp ######
+echo Job finished at `date '+%T %a %d %b %Y'`

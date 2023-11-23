@@ -1,0 +1,68 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+#Correlations taxa, genes, and nonpolar metabolites
+```{r}
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis_microbial/tables/biobakery3/networks")
+nodes <- read_excel("matrices_path_taxa_genes.xlsx", sheet = "nodes")
+matrix <- read_excel("matrices_path_taxa_genes.xlsx", sheet = "matrix_all") %>% 
+  remove_rownames %>% column_to_rownames(var="feature")
+```
+
+```{r}
+library(Hmisc)
+#Calculating correlations
+correlations <-rcorr(t(matrix))
+
+#Function to change correlation table format
+flattenCorrMatrix <- function(cormat, pmat) {
+  ut <- upper.tri(cormat)
+  data.frame(
+    row = rownames(cormat)[row(cormat)[ut]],
+    column = rownames(cormat)[col(cormat)[ut]],
+    cor  =(cormat)[ut],
+    p = pmat[ut]
+    )
+}
+
+edges = flattenCorrMatrix(correlations$r, correlations$P)
+
+#Renaming columns, adding correlation type, and filtering correlations higher than 0.75
+edges <- edges %>% 
+  dplyr::rename(Label = row, Target = column, Correlation = cor) %>% #Labels required in Gephi
+  mutate(Type = "undirected") %>% #This column is required in Gephi, tells the direction of the relationship between nodes
+  filter(Correlation >= 0.75, p <= 0.05) #Filtering significant correlations
+
+#Changing labels for id numbers (corresponding to node id). This is the format that Gephi requires
+edges_source_numbers <- left_join(edges,nodes, by = "Label") %>%
+  dplyr::rename(Source = id) %>% 
+  dplyr::select(Source, Target, Correlation, Type.x) %>% 
+  dplyr::rename(Label = Target)
+
+edges_target_source_numbers <- left_join(edges_source_numbers,nodes, by = "Label") %>% 
+  dplyr::select(Source, id, Correlation, Type.x) %>% 
+  dplyr::rename(Target = id, Type = Type.x)
+
+#edges create a variable to check the type of conncetion
+edges_type <- left_join(edges,nodes, by = "Label") %>%
+  dplyr::rename(Source = Label, Label = Target)
+
+edges_type <- left_join(edges_type,nodes, by = "Label") 
+
+edges_type$Connection <- paste(edges_type$Type.y,"-",edges_type$Type)
+
+#Filter connections of interest
+edges_target_source_numbers$Connection <- edges_type$Connection
+edges_target_source_numbers <- edges_target_source_numbers %>% filter(Connection %in% c("Pathway - Taxa","Pathway - ARG","Pathway - Virulence")) %>% select(Source, Target,Correlation,Type)
+
+#Saving edges files as csv
+
+#Edge table with node labels (just for reference)
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis_microbial/tables/biobakery3/networks")
+write.csv(edges_type, "edges_labels.csv", row.names = F)
+
+#Edge table with node numbers (the one to use in Gephi)
+write.csv(edges_target_source_numbers, "edges_gephi.csv", row.names = F)
+```

@@ -1,0 +1,401 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+##Importing tables
+```{r echo = FALSE}
+library(dplyr)
+library(readxl)
+
+setwd("/Users/karlavasco/Documents/")
+
+#read in otu table
+otu_table = read_excel("metabolites_classification_mastitis.xlsx", sheet="matrix")
+
+library(tibble)
+otu_table <- otu_table %>% remove_rownames %>% column_to_rownames(var="OTU")
+otu_table=as.matrix(otu_table)
+otu_table <- otu_table*10^9
+mode(otu_table) <- "integer"
+
+#read in taxonomy
+taxonomy = read_excel("metabolites_classification_mastitis.xlsx", sheet="taxonomy")
+taxonomy <- taxonomy %>% remove_rownames %>% column_to_rownames(var="OTU")
+taxonomy=as.matrix(taxonomy)
+
+#read in metadata
+metadata <- read_excel("metabolites_classification_mastitis.xlsx", sheet = "metadata")
+metadata <- metadata %>% remove_rownames %>% column_to_rownames(var="sample_ID")
+
+library("phyloseq")
+
+#import as phyloseq objects
+OTU = otu_table(otu_table,taxa_are_rows=TRUE)
+TAX = tax_table(taxonomy)
+META = sample_data(metadata)
+
+#Final phyloseq output is named as physeq
+physeq_metabolome=phyloseq(OTU,TAX,META)
+```
+
+# Aglomerating pathways at the Subclass level
+```{r}
+physeq_subclass <- tax_glom(physeq_metabolome, taxrank = "Class")
+```
+
+# Converting phyloseq object to dataframe
+```{r}
+physeq_subclass_df <- psmelt(physeq_subclass)
+```
+# Summary table
+```{r}
+mean_metabolites <- physeq_metabolome %>% psmelt() %>% 
+  group_by(Treatment, Time_tx, Class, Name, feature) %>% 
+  summarise(Average = mean(Abundance)/10^9)
+```
+```{r}
+write.csv(mean_metabolites, "/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis/tables/mean_metabolites.csv", row.names = F)
+```
+
+# converting dataframe to matrix 
+```{r}
+library(tibble)
+path_subclass_mx <- physeq_subclass_df %>% select(Sample, Class, Abundance) %>% pivot_wider(names_from = Class, values_from = Abundance) %>% column_to_rownames("Sample") %>% as.matrix()
+```
+
+# Annotations for Heatmap
+```{r}
+library(dplyr)
+annotation_samples <- physeq_subclass_df %>% 
+  dplyr::select(Sample, Treatment, Time_tx) %>% distinct() %>%    
+  remove_rownames %>% column_to_rownames(var="Sample")
+
+
+anno_color <- list(Treatment = c(Control = "#3B4992FF", Antibiotic = "#EE0000FF"),
+                   Time_tx = c(`Day -1` = "#FFD700", `Week 1`= "#008000", 
+                                `Week 9`="#800080"))
+```
+
+```{r fig.height=10}
+library(pheatmap)
+library(viridis) #color pallet, it's optional
+library(RColorBrewer)
+
+#HEATMAP RA USING ln color pallet RBrewer
+heatmap <- pheatmap(
+  mat               = t(log(path_subclass_mx+1)),
+  border_color      = NA,
+  show_colnames     = F,
+  show_rownames     = T,
+  angle_col = 90,
+#  drop_levels       = TRUE,
+ # fontsize_col = 4,
+ fontsize_row = 5,
+#  fontsize          = 14,
+ # color             = brewer.pal(9,"RdYlBu"),
+#color = inferno(100),  
+#number_color = NA,
+ annotation_col = annotation_samples,
+  annotation_colors = anno_color,
+  annotation_names_col = F,
+  annotation_names_row = F,
+  cluster_cols = T,
+  cluster_rows = T,
+ clustering_method = "ward.D2",
+  gaps_row = FALSE,
+)
+heatmap
+```
+```{r}
+library(ggplot2)
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis/figures")
+ggsave(plot=heatmap, "heatmap_metabolites_mastitis.png", width = 10, height = 10)
+
+```
+
+# Differential abundance analyses
+
+Aggregate phyloseq objects by time points
+```{r}
+physeq_day1_week1 <- subset_samples(physeq_subclass, Time_tx%in%c("Day -1","Week 1"))
+physeq_day1_week9 <- subset_samples(physeq_subclass, Time_tx%in%c("Day -1","Week 9"))
+physeq_week9_1 <- subset_samples(physeq_subclass, Time_tx%in%c("Week 1","Week 9"))
+```
+
+Aggregate phyloseq objects by time points
+```{r}
+physeq_day1 <- subset_samples(physeq_subclass, Time_tx%in%"Day -1")
+physeq_week1 <- subset_samples(physeq_subclass, Time_tx%in%c("Week 1"))
+physeq_week9 <- subset_samples(physeq_subclass, Time_tx%in%c("Week 9"))
+```
+
+Day 0 (other time points were done in the same way)
+```{r}
+physeq <- physeq_day1
+```
+
+
+MaAsLin2
+```{r results = FALSE}
+library(Maaslin2)
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis/tables/metabolites")
+# Formating abundance table for MaAsLin2 
+table <- merge(physeq@tax_table,data.frame(otu_table(physeq)), by = 0) %>% remove_rownames %>% column_to_rownames(var="Row.names")
+
+fit_data = Maaslin2(
+  input_data = merge(physeq@tax_table,data.frame(otu_table(physeq)), by = 0) %>% 
+    remove_rownames %>% column_to_rownames(var="Row.names")  %>% select(5:44),
+  input_metadata = metadata,
+  output = 'maaslin2_day1_treatment',
+  fixed_effects = c('Time_tx'),
+#  random_effects = c("temperature_Celsius"),
+  min_prevalence = 0.01,
+  min_abundance =  0.0,
+  standardize = F
+)
+```
+
+# Aglomerating pathways at the Subclass level
+```{r}
+physeq_name <- tax_glom(physeq_metabolome, taxrank = "Name")
+```
+
+# Converting phyloseq object to dataframe
+```{r}
+physeq_df <- psmelt(physeq_name)
+```
+
+# Random Forest
+```{r}
+library(microbial)
+rf_time <- biomarker(physeq=physeq_name, group = "Time_tx", normalize = F)
+```
+
+```{r}
+rf_time %>% head(n=25) %>% ggbarplot(y="Value",x="Name"
+                                     #, fill = "Class", palette = "simpsons"
+                                     ) + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+```{r}
+library(microbial)
+rf_time <- biomarker(physeq=physeq_metabolome, group = "Time_tx", normalize = F)
+```
+
+```{r}
+rf_time %>% head(n=25) %>% ggbarplot(y="Value",x="Name") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+
+# Aglomerating pathways at the Subclass level
+```{r}
+physeq_name <- tax_glom(physeq_metabolome, taxrank = "Name")
+```
+
+# Converting phyloseq object to dataframe
+```{r}
+physeq_df <- psmelt(physeq_name)
+```
+
+```{r fig.height=8, fig.width=8}
+top25 <- rf_time %>% head(n=25)
+mean <- physeq_df %>% group_by(Name) %>% summarise(Average = mean(Abundance))
+
+order <- physeq_df %>% filter(Name %in% top25$Name) %>% merge(mean, by="Name") %>% mutate(FC=Abundance/Average) %>% group_by(Time_tx, Name) %>% summarise(top = mean(FC)) %>% filter(Time_tx=="Day -1") %>% arrange(top)
+top_25_plot <- physeq_df %>% filter(Name %in% top25$Name) %>% merge(mean, by="Name") %>% mutate(FC=Abundance/Average) %>% 
+  ggbarplot(x="Name",y="FC", fill="Time_tx", palette = c("#FFD700", "#008000", "#800080"),
+            add = c("mean_ci"), position = position_dodge(width = 0.7), orientation="horiz", xlab = "", ylab = "Fold change (mean)",
+            order = order$Name)
+top_25_plot
+```
+
+
+```{r}
+library(ggplot2)
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis/figures")
+ggsave(plot=top_25_plot, "top25_rf_metabolites_mastitis.png", width = 10, height = 8)
+
+```
+
+```{r fig.height=10, fig.width=6}
+top50 <- rf_time %>% head(n=50)
+mean <- physeq_df %>% group_by(Name) %>% summarise(Average = mean(Abundance))
+
+top_50_plot <- physeq_df %>% filter(Name %in% top50$Name) %>% merge(mean, by="Name") %>% mutate(FC=Abundance/Average) %>% 
+  ggbarplot(x="Name",y="FC", fill="Time_tx", add = c("mean_se"), position = position_dodge2(), orientation="horiz", facet.by = "Time_tx")
+top_50_plot
+```
+# Converting phyloseq object to dataframe
+```{r}
+physeq_df <- psmelt(physeq_metabolome)
+```
+
+# converting dataframe to matrix 
+```{r}
+library(tibble)
+mean <- physeq_df %>% group_by(feature) %>% summarise(Average = mean(Abundance))
+
+metabolites_df <- physeq_df %>%  merge(mean, by="feature") %>% mutate(FC=Abundance/Average) %>% 
+  select(Sample, feature, FC) %>% filter(feature %in% top50$feature)
+
+metabolites_mx <- spread(metabolites_df, key=feature, value=FC,fill = 0) %>% 
+  select(-Glaucine, -`histamine-C15:0`,-`L-TYROSINE - 40.0 eV`) %>% 
+  column_to_rownames("Sample") %>% as.matrix() 
+```
+
+# Annotations for Heatmap
+```{r}
+library(dplyr)
+annotation_samples <- physeq_df %>% 
+  dplyr::select(Sample, Treatment, Time_tx) %>% distinct() %>%    
+  remove_rownames %>% column_to_rownames(var="Sample")
+
+
+anno_color <- list(Treatment = c(Control = "#3B4992FF", Antibiotic = "#EE0000FF"),
+                   Time_tx = c(`Day -1` = "#FFD700", `Week 1`= "#008000", 
+                                `Week 9`="#800080"))
+```
+
+```{r fig.height=10}
+library(pheatmap)
+library(viridis) #color pallet, it's optional
+library(RColorBrewer)
+
+#HEATMAP RA USING ln color pallet RBrewer
+heatmap <- pheatmap(
+  mat               = t(log10(metabolites_mx+1)),
+  border_color      = NA,
+  show_colnames     = F,
+  show_rownames     = T,
+  angle_col = 90,
+#  drop_levels       = TRUE,
+ # fontsize_col = 4,
+ fontsize_row = 5,
+#  fontsize          = 14,
+ # color             = brewer.pal(9,"RdYlBu"),
+#color = inferno(100),  
+#number_color = NA,
+ annotation_col = annotation_samples,
+  annotation_colors = anno_color,
+  annotation_names_col = F,
+  annotation_names_row = F,
+  cluster_cols = T,
+  cluster_rows = T,
+ clustering_method = "ward.D2",
+  gaps_row = FALSE,
+)
+heatmap
+```
+```{r}
+library(ggplot2)
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis/figures")
+ggsave(plot=heatmap, "heatmap_rf_metabolites_mastitis.pdf", width = 10, height = 8)
+
+```
+
+# Converting phyloseq object to dataframe
+```{r}
+physeq_df <- psmelt(physeq_metabolome)
+```
+
+# Treatment plot
+```{r}
+physeq_day1 <- subset_samples(physeq_metabolome, Time_tx%in%c("Day -1"))
+physeq_week1 <- subset_samples(physeq_metabolome, Time_tx%in%c("Week 1"))
+physeq_week9 <- subset_samples(physeq_metabolome, Time_tx%in%c("Week 9"))
+```
+
+```{r}
+library(microbial)
+rf_treatment <- biomarker(physeq=physeq_week9, group = "Treatment", normalize = F)
+rf_treatment
+```
+```{r fig.height=10}
+rf_treatment %>% head(n=25) %>% ggbarplot(y="Value",x="Name"
+                                     #, fill = "Class", palette = "simpsons"
+                                     ) + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+```{r fig.height=12, fig.width=8}
+top25 <- rf_treatment %>% head(n=25)
+mean <- physeq_df %>% filter(Time_tx=="Week 1") %>% group_by(Name) %>% summarise(Average = mean(Abundance))
+
+order <- physeq_df %>% filter(Name %in% top25$Name, Time_tx=="Week 1") %>% merge(mean, by="Name") %>% mutate(FC=Abundance/Average) %>% group_by(Treatment, Name) %>% summarise(top = mean(FC)) %>% filter(Treatment=="Control") %>% arrange(top)
+
+top_25_w1_plot <- physeq_df %>% 
+  filter(Name %in% top25$Name, Time_tx=="Week 1") %>% 
+  merge(mean, by="Name") %>% mutate(FC=Abundance/Average) %>% 
+  ggbarplot(x="Name", y="FC", fill="Treatment", palette = "npg",
+            add = c("mean_ci"), position = position_dodge(width = 0.7), 
+            orientation="horiz", xlab = "", ylab = "Fold change (mean)",
+            facet.by = "Time_tx",
+            order = order$Name
+            )
+top_25_w1_plot
+```
+
+```{r}
+physeq_df %>% 
+  filter(Name %in% top25$Name, Time_tx=="Week 9") %>% 
+  group_by(Name) %>% 
+  wilcox_test(Abundance ~ Treatment, paired = F, alternative = "less") %>% 
+  add_significance()
+```
+
+```{r}
+physeq_df %>% 
+  filter(Name %in% top25$Name, Time_tx=="Week 9") %>% 
+  group_by(Name) %>% 
+  wilcox_test(Abundance ~ Treatment, paired = F, alternative = "greater") %>% 
+  add_significance()
+```
+
+```{r fig.height=12, fig.width=8}
+top25 <- rf_treatment %>% head(n=25)
+mean <- physeq_df %>% filter(Time_tx=="Week 9") %>% group_by(Name) %>% summarise(Average = mean(Abundance))
+
+order <- physeq_df %>% filter(Name %in% top25$Name, Time_tx=="Week 9") %>% merge(mean, by="Name") %>% mutate(FC=Abundance/Average) %>% group_by(Treatment, Name) %>% summarise(top = mean(FC)) %>% filter(Treatment=="Control") %>% arrange(top)
+
+top_25_w9_plot <- physeq_df %>% 
+  filter(Name %in% top25$Name, Time_tx=="Week 9") %>% 
+  merge(mean, by="Name") %>% mutate(FC=Abundance/Average) %>% 
+  ggbarplot(x="Name", y="FC", fill="Treatment", palette = "npg",
+            add = c("mean_ci"), position = position_dodge(width = 0.7), 
+            orientation="horiz", xlab = "", ylab = "Fold change (mean)",
+            facet.by = "Time_tx",
+            order = order$Name
+            )
+top_25_w9_plot
+```
+
+
+```{r fig.height=12, fig.width=8}
+top25 <- rf_treatment %>% head(n=25)
+mean <- physeq_df %>% filter(Time_tx=="Day -1") %>% group_by(Name) %>% summarise(Average = mean(Abundance))
+
+order <- physeq_df %>% filter(Name %in% top25$Name, Time_tx=="Day -1") %>% merge(mean, by="Name") %>% mutate(FC=Abundance/Average) %>% group_by(Treatment, Name) %>% summarise(top = mean(FC)) %>% filter(Treatment=="Antibiotic") %>% arrange(top)
+
+top_25_d1_plot <- physeq_df %>% 
+  filter(Name %in% top25$Name, Time_tx=="Day -1") %>% 
+  merge(mean, by="Name") %>% mutate(FC=Abundance/Average) %>% 
+  ggbarplot(x="Name", y="FC", fill="Treatment", palette = "npg",
+            add = c("mean_ci"), position = position_dodge(width = 0.7), 
+            orientation="horiz", xlab = "", ylab = "Fold change (mean)",
+            facet.by = "Time_tx",
+            order = order$Name
+            )
+top_25_d1_plot
+```
+
+```{r fig.width=20}
+metabolite_diff_plots <- ggarrange(top_25_w1_plot, top_25_w9_plot, labels = c("A","B"), nrow=1, common.legend = T)
+metabolite_diff_plots
+```
+
+```{r}
+library(ggplot2)
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis/figures")
+ggsave(plot=metabolite_diff_plots, "top25_rf_metabolites_mastitis.png", width = 10, height = 6)
+```

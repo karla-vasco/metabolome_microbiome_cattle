@@ -1,0 +1,25 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+alpha_div <- ggarrange(observed_polar, observed_nonpolar, observed_path, shannon_polar, shannon_nonpolar, shannon_path, nrow=2, ncol=3, common.legend = T, labels = c("A","B","C","D","E","F"))
+alpha_div
+```
+
+```{r}
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis/figures")
+ggsave(plot=alpha_div,"alpha_diversity_plots_final.png", height = 10,width = 15)
+```
+
+```{r}
+beta_div_metabolites <- ggarrange(bray_polar, bray_nonpolar, nrow=1, ncol=2, common.legend = T, legend = "right")
+beta_div <- ggarrange(beta_div_metabolites, bray_path, nrow=1, ncol=2, widths = c(1,.75), labels = c("A","B"))
+beta_div
+```
+
+```{r}
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis/figures")
+ggsave(plot=beta_div,"beta_diversity_plots_nogap.png", height = 6,width = 20)
+```

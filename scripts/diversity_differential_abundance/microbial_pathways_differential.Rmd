@@ -1,0 +1,535 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+library(microbial)
+library(microbiome)
+library(ggpubr)
+```
+
+#Importing tables
+```{r}
+setwd("~/OneDrive\ -\ Michigan\ State\ University/Manning_lab/Metabolomics_mastitis_microbial/tables/biobakery3/")
+
+library(readxl)
+#read in otu table (smartchip normalized abundance)
+otu_table <- read_excel("phyloseq_tables_biobakery.xlsx", sheet = "humann_pathabundance_relab")
+
+library(dplyr)
+library(tibble)
+#converting the abundance table to matrix (required to merge with taxonomy table)
+otu_table <- otu_table %>% remove_rownames %>% column_to_rownames(var="OTU_ID") 
+otu_table=as.matrix(otu_table,rownames=TRUE)
+otu_table <- otu_table*10^9
+#otu_table[otu_table >0]<-1
+mode(otu_table) <- "integer"
+
+#converting empty values to 0 (in case they exist)
+otu_table[is.na(otu_table)] <- 0
+
+#read in taxonomy (gene ID for smartchip)
+taxonomy <- read_excel("phyloseq_tables_biobakery.xlsx", sheet = "taxonomy_path")
+
+taxonomy_df <- read_excel("~/OneDrive\ -\ Michigan\ State\ University/Manning_lab/Metabolomics_mastitis_microbial/tables/biobakery3/phyloseq_tables_biobakery.xlsx", sheet = "taxonomy_path")
+#setting taxonomy row_names for GENE_ID (that will enable merging with the abundance table)
+taxonomy <- taxonomy %>% remove_rownames %>% column_to_rownames(var="OTU_ID")
+taxonomy=as.matrix(taxonomy)
+
+#read in metadata
+metadata <- read_excel("phyloseq_tables_biobakery.xlsx", sheet = "metadata")
+
+#setting metadata row_names for sample ID (that will enable merging with the other tables)
+metadata <- metadata %>% remove_rownames %>% column_to_rownames(var="sequence_id")
+
+library(forcats)
+#Changing the levels of source and group to make them better organized in the plots
+metadata <- metadata %>% mutate(Treatment = fct_relevel(Treatment,"Control","Antibiotic"))
+
+library("phyloseq")
+
+#import all tables as phyloseq objects
+OTU = otu_table(otu_table,taxa_are_rows=TRUE)
+TAX = tax_table(taxonomy)
+META = sample_data(metadata)
+
+#Making phyloseq object
+physeq=phyloseq(OTU,TAX,META)
+```
+#Exporting physeq as dataframe
+```{r}
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis_microbial/tables/biobakery3/")
+
+physeq_df <- psmelt(physeq) 
+write.csv(physeq_df,file = "pathways_physeq_relab.csv")
+```
+###Random forest 
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq))
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq)$Time_tx)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.pathways <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.pathways)
+```
+
+```{r fig.height=4}
+library(ggplot2)
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.pathways)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_pathways <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_pathways$predictors <- factor(imp.sort_pathways$predictors, levels = imp.sort_pathways$predictors)
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_pathways[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = predictors, y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important pathways for classifying fecal samples")
+```
+
+##Aggregate samples by time points
+```{r}
+`%notin%` <- Negate(`%in%`)
+physeq_path <- tax_glom(physeq, "Pathway")
+physeq <- physeq_path
+```
+
+###Random forest 
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq))
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq)$Time_tx)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.pathways <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.pathways)
+```
+
+```{r fig.height=4}
+library(ggplot2)
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.pathways)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_pathways <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_pathways$predictors <- factor(imp.sort_pathways$predictors, levels = imp.sort_pathways$predictors)
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_pathways[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = predictors, y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important pathways for classifying fecal samples")
+```
+#COMPARISONS BETWEEN TIME POINTS
+
+##Aggregate samples by time points
+```{r}
+`%notin%` <- Negate(`%in%`)
+physeq_d1_w1 <- subset_samples(physeq, Time_tx%in%c("Day -1","Week 1"))
+physeq_d1_w9 <- subset_samples(physeq, Time_tx%in%c("Day -1","Week 9"))
+physeq_w1_w9 <- subset_samples(physeq, Time_tx%in%c("Week 1","Week 9"))
+```
+
+##DAY 1 VS WEEK 1
+```{r}
+physeq <- physeq_d1_w1 #To compare pathways
+```
+
+###LEfSE
+```{r}
+library(microbial)
+lefse <- ldamarker(physeq, group="Time_tx", pvalue = 0.05, normalize = T,method = "log2")
+lefse_sigtab <- lefse[which(lefse$p.adj<=0.05), ]
+lefse_sigtab <- lefse_sigtab %>% select(rank, direction,tax, LDAscore, p.value, p.adj) %>% arrange(tax)
+lefse_sigtab
+```
+
+###Random forest 
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq))
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq)$Time_tx)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.pathways <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.pathways)
+```
+
+```{r fig.height=4}
+library(ggplot2)
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.pathways)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_pathways <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_pathways$predictors <- factor(imp.sort_pathways$predictors, levels = imp.sort_pathways$predictors)
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_pathways[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = predictors, y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important pathways for classifying fecal samples")
+```
+
+###ANCOM
+```{r}
+library(nloptr)
+library(ANCOMBC)
+#ANCOMBC analysis comparison between Time_tx groups
+out = ancombc(phyloseq = physeq, formula = "Time_tx",
+              p_adj_method = "holm", zero_cut = 0.90, lib_cut = 0,
+              group = "Time_tx", struc_zero = F, neg_lb = FALSE,
+              tol = 1e-05, max_iter = 100, conserve = TRUE,
+              alpha = 0.05, global = TRUE)
+
+#ANCOMBC results as a list
+res = out$res
+
+#ANCOMBC results as a table
+ancom_results = res %>% as_tibble()
+
+#Filtering only significant results
+ancom_signif_list <- ancom_results %>% filter(diff_abn == "TRUE")
+
+#Adding feature names to the table
+ancom_signif_names <- data.frame(sapply(ancom_signif_list,c)) 
+row.names(ancom_signif_names) <- rownames(ancom_signif_list$beta) 
+ancom_signif_names <- tibble::rownames_to_column(ancom_signif_names, "OTU_ID")
+ancom_pathways <- merge(taxonomy_df,ancom_signif_names,by.x = "OTU_ID")
+```
+#Aldex2
+```{r}
+library(ALDEx2)
+aldex2_da <- ALDEx2::aldex(data.frame(phyloseq::otu_table(physeq)), 
+                           phyloseq::sample_data(physeq)$Time_tx, 
+                           test="t", effect = TRUE, denom="iqlr")
+
+#Clean up presentation
+sig_aldex2 <- aldex2_da %>%
+  rownames_to_column(var = "OTU_ID") %>%
+  filter(wi.ep < 0.05) %>%
+  arrange(effect, wi.ep) %>%
+  dplyr::select(OTU_ID, diff.btw, diff.win, effect, wi.ep, wi.eBH)
+
+sig_aldex2 <- merge(taxonomy_df,sig_aldex2,by.x = "OTU_ID")
+
+```
+
+###Exporting files to excel
+```{r}
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis_microbial/tables/biobakery3/diff_paths_time")
+library(xlsx)
+write.xlsx(as.data.frame(lefse_sigtab), file="pathways_d1_w1_Time_tx_diff.xlsx", sheetName="lefse", row.names=FALSE)
+write.xlsx(imp.sort_pathways, file="pathways_d1_w1_Time_tx_diff.xlsx", sheetName="randomForest_clust", append=TRUE, row.names=FALSE)
+write.xlsx(ancom_pathways, file="pathways_d1_w1_Time_tx_diff.xlsx", sheetName="ancom_pathways", append=TRUE, row.names=FALSE)
+write.xlsx(sig_aldex2, file="pathways_d1_w1_Time_tx_diff.xlsx", sheetName="aldex2", append=TRUE, row.names=FALSE)
+```
+
+###MaAsLin2
+pathways
+```{r}
+library(Maaslin2)
+library(microbiome)
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis_microbial/tables/biobakery3/diff_paths_time")
+
+fit_data = Maaslin2(
+  input_data = merge(physeq@tax_table,data.frame(otu_table(physeq)), by = 0) %>%
+    remove_rownames %>% 
+    column_to_rownames(var="OTU") %>% dplyr::select(6:85),
+  input_metadata = meta(physeq),
+  output = 'maaslin2_pathways_d1_w1',
+  fixed_effects = c('Time_tx'),
+  min_prevalence = 0.01,
+  min_abundance =  0.0,
+  standardize = T, plot_scatter = F
+)
+```
+
+##DAY 1 VS WEEK 9
+```{r}
+physeq <- physeq_d1_w9 #To compare pathways
+```
+
+###LEfSE
+```{r}
+lefse <- ldamarker(physeq, group="Time_tx", pvalue = 0.05, normalize = T,method = "log2")
+lefse_sigtab <- lefse[which(lefse$p.adj<=0.05), ]
+lefse_sigtab <- lefse_sigtab %>% dplyr::select(rank, direction,tax, LDAscore, p.value, p.adj) %>% arrange(tax)
+lefse_sigtab
+```
+
+###Random forest 
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq))
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq)$Time_tx)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.pathways <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.pathways)
+```
+
+```{r fig.height=4}
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.pathways)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_pathways <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_pathways$predictors <- factor(imp.sort_pathways$predictors, levels = imp.sort_pathways$predictors)
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_pathways[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = predictors, y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important pathways for classifying fecal samples")
+```
+
+###ANCOM
+```{r}
+library(nloptr)
+library(ANCOMBC)
+#ANCOMBC analysis comparison between Time_tx groups
+out = ancombc(phyloseq = physeq, formula = "Time_tx",
+              p_adj_method = "holm", zero_cut = 0.90, lib_cut = 0,
+              group = "Time_tx", struc_zero = F, neg_lb = FALSE,
+              tol = 1e-05, max_iter = 100, conserve = TRUE,
+              alpha = 0.05, global = TRUE)
+
+#ANCOMBC results as a list
+res = out$res
+
+#ANCOMBC results as a table
+ancom_results = res %>% as_tibble()
+
+#Filtering only significant results
+ancom_signif_list <- ancom_results %>% filter(diff_abn == "TRUE")
+
+#Adding feature names to the table
+ancom_signif_names <- data.frame(sapply(ancom_signif_list,c)) 
+row.names(ancom_signif_names) <- rownames(ancom_signif_list$beta) 
+ancom_signif_names <- tibble::rownames_to_column(ancom_signif_names, "OTU_ID")
+ancom_pathways <- merge(taxonomy_df,ancom_signif_names,by.x = "OTU_ID")
+```
+#Aldex2
+```{r}
+library(ALDEx2)
+aldex2_da <- ALDEx2::aldex(data.frame(phyloseq::otu_table(physeq)), 
+                           phyloseq::sample_data(physeq)$Time_tx, 
+                           test="t", effect = TRUE, denom="iqlr")
+
+#Clean up presentation
+sig_aldex2 <- aldex2_da %>%
+  rownames_to_column(var = "OTU_ID") %>%
+  filter(wi.ep < 0.05) %>%
+  arrange(effect, wi.ep) %>%
+  dplyr::select(OTU_ID, diff.btw, diff.win, effect, wi.ep, wi.eBH)
+
+sig_aldex2 <- merge(taxonomy_df,sig_aldex2,by.x = "OTU_ID")
+```
+
+
+###Exporting files to excel
+```{r}
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis_microbial/tables/biobakery3/diff_paths_time")
+#library(xlsx)
+write.xlsx(as.data.frame(lefse_sigtab), file="pathways_d1_w9_Time_tx_diff.xlsx", sheetName="lefse", row.names=FALSE)
+write.xlsx(imp.sort_pathways, file="pathways_d1_w9_Time_tx_diff.xlsx", sheetName="randomForest_clust", append=TRUE, row.names=FALSE)
+write.xlsx(ancom_pathways, file="pathways_d1_w9_Time_tx_diff.xlsx", sheetName="ancom_pathways", append=TRUE, row.names=FALSE)
+write.xlsx(sig_aldex2, file="pathways_d1_w9_Time_tx_diff.xlsx", sheetName="aldex2", append=TRUE, row.names=FALSE)
+```
+
+###MaAsLin2
+pathways
+```{r}
+library(Maaslin2)
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis_microbial/tables/biobakery3/diff_paths_time")
+
+fit_data = Maaslin2(
+  input_data = merge(physeq@tax_table,data.frame(otu_table(physeq)), by = 0) %>%
+    remove_rownames %>% 
+    column_to_rownames(var="OTU") %>% dplyr::select(6:83),
+  input_metadata = meta(physeq),
+  output = 'maaslin2_pathways_d1_w9',
+  fixed_effects = c('Time_tx'),
+  min_prevalence = 0.01,
+  min_abundance =  0.0,
+  standardize = T, plot_scatter = F
+)
+```
+
+##WEEK 1 VS WEEK 9
+```{r}
+physeq <- physeq_w1_w9 #To compare pathways
+```
+
+###LEfSE
+```{r}
+lefse <- ldamarker(physeq, group="Time_tx", pvalue = 0.05, normalize = T,method = "log2")
+lefse_sigtab <- lefse[which(lefse$p.adj<=0.05), ]
+lefse_sigtab <- lefse_sigtab %>% dplyr::select(rank, direction,tax, LDAscore, p.value, p.adj) %>% arrange(tax)
+lefse_sigtab
+```
+
+###Random forest 
+```{r}
+# Make a dataframe of training data with OTUs as column and samples as rows
+predictors <- t(otu_table(physeq))
+dim(predictors)
+
+# Make one column for our outcome/response variable 
+response <- as.factor(sample_data(physeq)$Time_tx)
+
+# Combine them into 1 data frame
+rf.data <- data.frame(response, predictors)
+
+#Running random forest
+library(randomForest)
+set.seed(2)
+classify.pathways <- randomForest(response~., data = rf.data, ntree = 5000, importance = T)
+print(classify.pathways)
+```
+
+```{r fig.height=4}
+# Make a data frame with predictor names and their importance
+imp <- importance(classify.pathways)
+imp <- data.frame(predictors = rownames(imp), imp)
+
+# Order the predictor levels by importance
+imp.sort_pathways <- arrange(imp, desc(MeanDecreaseAccuracy))
+imp.sort_pathways$predictors <- factor(imp.sort_pathways$predictors, levels = imp.sort_pathways$predictors)
+
+# Select the top 10 predictors
+imp.20 <- imp.sort_pathways[1:20, ]
+
+# ggplot
+ggplot(imp.20, aes(x = predictors, y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = "indianred") +
+  coord_flip() +
+  ggtitle("Most important pathways for classifying fecal samples")
+```
+
+###ANCOM
+```{r}
+library(nloptr)
+library(ANCOMBC)
+#ANCOMBC analysis comparison between Time_tx groups
+out = ancombc(phyloseq = physeq, formula = "Time_tx",
+              p_adj_method = "holm", zero_cut = 0.90, lib_cut = 0,
+              group = "Time_tx", struc_zero = F, neg_lb = FALSE,
+              tol = 1e-05, max_iter = 100, conserve = TRUE,
+              alpha = 0.05, global = TRUE)
+
+#ANCOMBC results as a list
+res = out$res
+
+#ANCOMBC results as a table
+ancom_results = res %>% as_tibble()
+
+#Filtering only significant results
+ancom_signif_list <- ancom_results %>% filter(diff_abn == "TRUE")
+
+#Adding feature names to the table
+ancom_signif_names <- data.frame(sapply(ancom_signif_list,c)) 
+row.names(ancom_signif_names) <- rownames(ancom_signif_list$beta) 
+ancom_signif_names <- tibble::rownames_to_column(ancom_signif_names, "OTU_ID")
+ancom_pathways <- merge(taxonomy_df,ancom_signif_names,by.x = "OTU_ID")
+```
+#Aldex2
+```{r}
+library(ALDEx2)
+aldex2_da <- ALDEx2::aldex(data.frame(phyloseq::otu_table(physeq)), 
+                           phyloseq::sample_data(physeq)$Time_tx, 
+                           test="t", effect = TRUE, denom="iqlr")
+
+#Clean up presentation
+sig_aldex2 <- aldex2_da %>%
+  rownames_to_column(var = "OTU_ID") %>%
+  filter(wi.ep < 0.05) %>%
+  arrange(effect, wi.ep) %>%
+  dplyr::select(OTU_ID, diff.btw, diff.win, effect, wi.ep, wi.eBH)
+
+sig_aldex2 <- merge(taxonomy_df,sig_aldex2,by.x = "OTU_ID")
+```
+
+
+###Exporting files to excel
+```{r}
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis_microbial/tables/biobakery3/diff_paths_time")
+#library(xlsx)
+write.xlsx(as.data.frame(lefse_sigtab), file="pathways_w1_w9_Time_tx_diff.xlsx", sheetName="lefse", row.names=FALSE)
+write.xlsx(imp.sort_pathways, file="pathways_w1_w9_Time_tx_diff.xlsx", sheetName="randomForest_clust", append=TRUE, row.names=FALSE)
+write.xlsx(ancom_pathways, file="pathways_w1_w9_Time_tx_diff.xlsx", sheetName="ancom_pathways", append=TRUE, row.names=FALSE)
+write.xlsx(sig_aldex2, file="pathways_w1_w9_Time_tx_diff.xlsx", sheetName="aldex2", append=TRUE, row.names=FALSE)
+```
+
+###MaAsLin2
+pathways
+```{r}
+library(Maaslin2)
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis_microbial/tables/biobakery3/diff_paths_time")
+
+fit_data = Maaslin2(
+  input_data = merge(physeq@tax_table,data.frame(otu_table(physeq)), by = 0) %>%
+    remove_rownames %>% 
+    column_to_rownames(var="OTU") %>% dplyr::select(6:83),
+  input_metadata = meta(physeq),
+  output = 'maaslin2_pathways_w1_w9',
+  fixed_effects = c('Time_tx'),
+  min_prevalence = 0.01,
+  min_abundance =  0.0,
+  standardize = T, plot_scatter = F
+)
+```
+
+

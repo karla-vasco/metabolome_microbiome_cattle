@@ -1,0 +1,48 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+#Import table
+```{r}
+library(readxl)
+
+differential <- read_excel("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis_microbial/tables/biobakery3/diff_paths_time/summary_diff_pathways.xlsx", sheet = "more_than2")
+
+time_d1w1 <- differential %>% filter(Comparison == "Day -1 vs. Week 1")
+time_d1w9 <- differential %>% filter(Comparison == "Day -1 vs. Week 9")
+time_w1w9 <- differential %>% filter(Comparison == "Week 1 vs. Week 9")
+
+differential_IDs <- merge(differential, taxonomy_df, by = "OTU")
+```
+
+```{r}
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitis/tables/polar/feature_tables/")
+
+abundance_table <- read.csv("polar_physeq_relab.csv",row.names = 1)
+
+diff_ab_metadata <- merge(differential_IDs,abundance_table,by="LibraryID")
+```
+
+
+##Venn diagram
+```{r}
+#install.packages('VennDiagram')
+library(ggsci)
+library(ggpubr)
+setwd("/Users/karlavasco/Library/CloudStorage/OneDrive-MichiganStateUniversity/Manning_lab/Metabolomics_mastitiS_microbial/figures/biobakery")
+library(VennDiagram)
+myCol <- get_palette("aaas",3)
+venn_virulence <- venn.diagram(list(`Day -1 vs. Week 1` = time_d1w1$OTU, `Day -1 vs. Week 9` = time_d1w9$OTU, `Week 1 vs. Week 9` = time_w1w9$OTU), 
+                   alpha = c(0.5, 0.5, 0.5),
+                   filename="pathways_venn_metabolites_time.png",
+                   output =  TRUE,
+                   imagetype = "png",
+                  main = "Time of collection", main.fontface = "bold", main.fontfamily = "sans", main.cex = 2,
+                  lwd = 2,
+                   print.mode =  c("raw","percent"),
+                   lty = 'blank',
+                   height = 4000 , 
+                   width = 4000 , 
+                   fill = myCol,
+                   fontfamily = "sans", cat.fontfamily = "sans",cat.fontface = "bold")
+```
